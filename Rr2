@@ -1,0 +1,1104 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+enhanced_corrosion_tk_app.py
+
+برنامج متطور ومحسن لحساب معدل التآكل من بيانات Excel.
+يستخدم واجهة مستخدم عربية محسنة مع شريط التقدم والمعاينة المباشرة.
+يتميز بخاصية "الذكاء الاصطناعي" المتقدمة للكشف عن القيم الشاذة.
+يقوم بحفظ النتائج في ملف إخراج جديد بتنسيق مُحدد ومنسق.
+"""
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+from pathlib import Path
+import pandas as pd
+import numpy as np
+import re
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, Border, Side, PatternFill
+from openpyxl.utils import get_column_letter
+import datetime
+import threading
+import os
+import subprocess
+import sys
+
+# Attempt to import scikit-learn for AI features
+try:
+    from sklearn.ensemble import IsolationForest
+    from sklearn.preprocessing import RobustScaler
+    HAS_SK = True
+except ImportError:
+    HAS_SK = False
+
+# Import tabulate for instructions formatting
+try:
+    from tabulate import tabulate
+    HAS_TABULATE = True
+except ImportError:
+    HAS_TABULATE = False
+
+# ------------------ Constants ------------------
+DEFAULT_RTV_FACTOR = 2.331
+DEFAULT_RTV_CONV = 0.001
+
+# Keywords for part titles
+PART_KEYWORDS = ['"', 'inch', 'in', 'انش', 'انبوب', 'أنبوب', 'محطة', 'Part', 'POINTS', 'Points', 'tube', 'line']
+
+# Expected headers in the input file
+INPUT_HEADERS = ['Coth_old (μm)', 'Coth_new (μm)', 'RTV (mm)', 'Thme_new(mm)']
+OUTPUT_HEADERS = ['Points', 'COth (mm)', 'THme (mm)', 'RTV (mm)', 'OL (mm)', 'CR (mm)', 'ملاحظات الذكاء الاصطناعي']
+
+# ------------------ Data Processing Functions ------------------
+
+def extract_numbers_from_text(s: str):
+    """
+    Extracts numbers from a string, supporting comma or period as decimal separators.
+    """
+    if s is None:
+        return []
+    s2 = str(s).replace('٬', '.').replace(',', '.').replace('٫', '.')
+    s2 = s2.replace('\xa0', ' ').replace(' ', '')
+    nums = re.findall(r'[-+]?\d*\.\d+|[-+]?\d+', s2)
+    return nums
+
+def looks_like_part_title(s: str) -> bool:
+    """
+    Checks if a string looks like a part title based on keywords and numbers.
+    """
+    if not isinstance(s, str):
+        return False
+    s = s.strip()
+    if len(s) < 2:
+        return False
+    for kw in PART_KEYWORDS:
+        if kw.lower() in s.lower():
+            return True
+    if re.search(r'[اأإء-ي]', s) and (re.search(r'أنبوب|خط|pipe|line', s, flags=re.I) or re.search(r'\d',s)):
+        return True
+    return False
+
+def extract_blocks_from_sheet(df: pd.DataFrame):
+    """
+    Parses an Excel sheet into "blocks", where each block represents a part.
+    A block starts with a part title and continues until another title or end of sheet.
+    """
+    blocks = []
+    current_block = None
+    df = df.fillna('')
+   
+    for idx, row in df.iterrows():
+        row_text = ' '.join([str(x).strip() for x in row.tolist() if str(x).strip() != ""]).strip()
+       
+        if not row_text and current_block:
+            current_block['lines'].append((idx, row.tolist(), row_text))
+            continue
+       
+        if looks_like_part_title(row_text):
+            if current_block:
+                blocks.append(current_block)
+            current_block = {'title_row': idx, 'title': row_text, 'lines': []}
+        elif current_block:
+            current_block['lines'].append((idx, row.tolist(), row_text))
+   
+    if current_block:
+        blocks.append(current_block)
+   
+    return blocks
+
+def parse_block_lines(block):
+    """
+    Parses lines within a block to extract data points and notes.
+    """
+    points = []
+    notes = []
+    capture_notes = False
+   
+    for i, (idx, rowvals, rowtext) in enumerate(block['lines']):
+        text_lower = rowtext.lower()
+       
+        if 'notes' in text_lower or 'ملاحظات' in text_lower:
+            capture_notes = True
+            continue
+       
+        if capture_notes:
+            vals = [str(v).strip() for v in rowvals if str(v).strip() != ""]
+            if vals:
+                notes.append(' '.join(vals))
+            continue
+       
+        tokens = [str(t).strip() for t in rowvals if str(t).strip() != ""]
+        if not tokens:
+            continue
+           
+        label_guess = tokens[0]
+        t_join = ' '.join(tokens)
+        num_strs = extract_numbers_from_text(t_join)
+       
+        if not num_strs:
+            continue
+           
+        # Check if the row contains the expected number of values
+        if len(num_strs) >= 3:
+            try:
+                # Assuming the order: Coth_new, Thme_new, RTV (old)
+                coth_new = float(num_strs[1]) if len(num_strs) > 1 else 0
+                thme_new = float(num_strs[2]) if len(num_strs) > 2 else 0
+                rtv_old = float(num_strs[3]) if len(num_strs) > 3 else 0
+               
+                points.append({
+                    'label': label_guess,
+                    'Coth_new': coth_new,
+                    'Thme_new': thme_new,
+                    'RTV_old': rtv_old,
+                })
+            except (ValueError, IndexError):
+                # Ignore rows that don't fit the expected format
+                pass
+   
+    return {'title': block.get('title', ''), 'points': points, 'notes': notes}
+
+def compute_rtv_new(thme_val, coth_val, factor=DEFAULT_RTV_FACTOR):
+    """
+    Calculates the new RTV value based on the formula.
+    """
+    try:
+        if thme_val is None or coth_val is None:
+            return None
+        th = float(thme_val)
+        co = float(coth_val)
+        return th - (float(factor) * co * DEFAULT_RTV_CONV)
+    except Exception:
+        return None
+
+def compute_cr(rtv_old, rtv_new):
+    """
+    Calculates the Corrosion Rate (CR) from old and new RTV values.
+    """
+    try:
+        if rtv_old is None or rtv_new is None:
+            return None
+        return float(rtv_old) - float(rtv_new)
+    except Exception:
+        return None
+
+def extract_diameter_from_title(title: str):
+    """
+    Extracts the diameter in inches from a part title.
+    Example: "Pipe 12 inch" -> "12" or "10\" Line" -> "10"
+    """
+    if not isinstance(title, str):
+        return 'غير محدد'
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(?:\"|in|inch|inches|انش)", title, flags=re.I)
+    if m:
+        return m.group(1)
+    m2 = re.search(r'(\d+(?:\.\d+)?)"', title)
+    if m2:
+        return m2.group(1)
+    return 'غير محدد'
+
+def detect_anomalies(df_numeric):
+    """
+    Uses RobustScaler and IsolationForest to detect anomalies.
+    """
+    if not HAS_SK or df_numeric.empty or len(df_numeric) < 2:
+        return np.array([False] * len(df_numeric))
+    try:
+        X = df_numeric.fillna(df_numeric.mean())
+        scaler = RobustScaler()
+        Xs = scaler.fit_transform(X)
+        iso = IsolationForest(random_state=42, n_estimators=100, contamination='auto')
+        preds = iso.fit_predict(Xs)
+        return preds == -1
+    except Exception:
+        return np.array([False] * len(df_numeric))
+
+# ------------------ Main Processing Logic ------------------
+
+def process_excel_file(input_path: str, output_path: str, rtv_factor: float, enable_ai: bool, log_callback=None, progress_callback=None):
+    """
+    Reads the Excel file, processes the data, and saves the results in a new file.
+    """
+    if log_callback is None:
+        log_callback = print
+    if progress_callback is None:
+        progress_callback = lambda x: None
+
+    inp = Path(input_path)
+    if not inp.exists():
+        raise FileNotFoundError(f'Input file not found: {inp}')
+
+    log_callback(f'🔄 بدء قراءة ملف الإدخال: {inp.name}...')
+    progress_callback(10)
+    
+    try:
+        xls = pd.read_excel(inp, sheet_name=None, header=None, dtype=str)
+    except Exception as e:
+        raise ValueError(f'خطأ في قراءة ملف Excel: {e}')
+
+    progress_callback(25)
+    parts_data = []
+    total_sheets = len(xls)
+    
+    for sheet_idx, (sheet_name, df) in enumerate(xls.items()):
+        log_callback(f'🔍 تحليل ورقة العمل "{sheet_name}" ({sheet_idx + 1}/{total_sheets})')
+        blocks = extract_blocks_from_sheet(df)
+        log_callback(f'   ✅ تم العثور على {len(blocks)} جزء محتمل في الورقة')
+        
+        for i, b in enumerate(blocks):
+            parsed = parse_block_lines(b)
+            parsed['sheet_name'] = sheet_name
+            parts_data.append(parsed)
+        
+        progress = 25 + (sheet_idx + 1) * 30 / total_sheets
+        progress_callback(int(progress))
+
+    if not parts_data:
+        raise ValueError('❌ لم يتم العثور على بيانات صالحة في الملف.')
+
+    progress_callback(60)
+    log_callback(f'📊 إجمالي الأجزاء الموجودة: {len(parts_data)}')
+    log_callback('🔄 بدء إنشاء ملف الإخراج...')
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = 'نتائج حساب معدل التآكل'
+    row_idx = 1
+   
+    # Define styles
+    thin_border = Border(left=Side(style='thin'), right=Side(style='thin'), 
+                        top=Side(style='thin'), bottom=Side(style='thin'))
+    bold_font = Font(bold=True, size=12)
+    header_font = Font(bold=True, size=11, color="FFFFFF")
+    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+    anomaly_font = Font(color="FF0000", bold=True)
+    title_font = Font(bold=True, size=14)
+   
+    total_parts = len(parts_data)
+    
+    for part_idx, part in enumerate(parts_data):
+        log_callback(f'⚙️ معالجة الجزء ({part_idx + 1}/{total_parts}): "{part.get("title", "بلا اسم")}"')
+       
+        title = part.get('title', 'جزء بلا اسم')
+        diameter = extract_diameter_from_title(title)
+       
+        # Write part title and diameter row
+        ws.cell(row=row_idx, column=1, value='اسم الجزء:').font = title_font
+        ws.cell(row=row_idx, column=2, value=title)
+        ws.cell(row=row_idx, column=4, value='قطره بالانش:').font = title_font
+        ws.cell(row=row_idx, column=5, value=diameter)
+        
+        # Apply borders to the title row
+        for col in range(1, 8):
+            ws.cell(row=row_idx, column=col).border = thin_border
+       
+        row_idx += 2
+       
+        # Write table headers with styling
+        for col_num, header_text in enumerate(OUTPUT_HEADERS, start=1):
+            cell = ws.cell(row=row_idx, column=col_num, value=header_text)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal='center', vertical='center')
+            cell.border = thin_border
+       
+        row_idx += 1
+       
+        points_to_write = []
+        numeric_data = []
+       
+        # Process each point
+        for p in part.get('points', []):
+            rtv_old = p.get('RTV_old')
+            coth_new = p.get('Coth_new')
+            thme_new = p.get('Thme_new')
+           
+            rtv_new = compute_rtv_new(thme_new, coth_new, factor=rtv_factor)
+            cr = compute_cr(rtv_old, rtv_new)
+           
+            numeric_data.append({
+                'COth_new': coth_new,
+                'THme_new': thme_new,
+                'RTV_old': rtv_old,
+                'RTV_new': rtv_new,
+                'CR': cr,
+            })
+           
+            points_to_write.append({
+                'label': p.get('label'),
+                'Coth_new': coth_new,
+                'Thme_new': thme_new,
+                'RTV_old': rtv_old,
+                'RTV_new': rtv_new,
+                'CR': cr,
+            })
+           
+        log_callback(f'   📈 تم معالجة {len(points_to_write)} نقطة بيانات')
+       
+        # Anomaly detection
+        anomaly_mask = np.array([False] * len(numeric_data))
+        if enable_ai and len(numeric_data) > 1:
+            df_numeric = pd.DataFrame(numeric_data)
+            anomaly_mask = detect_anomalies(df_numeric)
+            anomalies_count = np.sum(anomaly_mask)
+            if anomalies_count > 0:
+                log_callback(f'   🤖 الذكاء الاصطناعي: تم العثور على {anomalies_count} قيم شاذة!')
+            else:
+                log_callback('   🤖 الذكاء الاصطناعي: لم يتم العثور على قيم شاذة')
+       
+        # Write data to table
+        for j, point in enumerate(points_to_write):
+            # Points column
+            ws.cell(row=row_idx, column=1, value=point['label']).border = thin_border
+            
+            # COth (mm) column
+            coth_cell = ws.cell(row=row_idx, column=2, value=point['Coth_new'])
+            coth_cell.border = thin_border
+            coth_cell.alignment = Alignment(horizontal='center')
+            
+            # THme (mm) column
+            thme_cell = ws.cell(row=row_idx, column=3, value=point['Thme_new'])
+            thme_cell.border = thin_border
+            thme_cell.alignment = Alignment(horizontal='center')
+            
+            # RTV (mm) column
+            rtv_cell = ws.cell(row=row_idx, column=4, value=point['RTV_new'])
+            rtv_cell.border = thin_border
+            rtv_cell.alignment = Alignment(horizontal='center')
+            
+            # OL (mm) column
+            ol_cell = ws.cell(row=row_idx, column=5, value=point['RTV_old'])
+            ol_cell.border = thin_border
+            ol_cell.alignment = Alignment(horizontal='center')
+            
+            # CR (mm) column
+            cr_cell = ws.cell(row=row_idx, column=6, value=point['CR'])
+            cr_cell.border = thin_border
+            cr_cell.alignment = Alignment(horizontal='center')
+           
+            # AI Notes column
+            ai_notes_cell = ws.cell(row=row_idx, column=7)
+            ai_notes_cell.border = thin_border
+            if enable_ai and j < len(anomaly_mask) and anomaly_mask[j]:
+                ai_notes_cell.value = 'قيمة شاذة'
+                ai_notes_cell.font = anomaly_font
+            else:
+                ai_notes_cell.value = ''
+            ai_notes_cell.alignment = Alignment(horizontal='center')
+           
+            row_idx += 1
+       
+        # Add notes if they exist
+        if part.get('notes'):
+            row_idx += 1
+            notes_title_cell = ws.cell(row=row_idx, column=1, value='الملاحظات:')
+            notes_title_cell.font = bold_font
+            notes_title_cell.border = thin_border
+            
+            notes_text = '\n'.join(part.get('notes'))
+            # Merge cells for notes (from column 2 to 7)
+            ws.merge_cells(start_row=row_idx, start_column=2, end_row=row_idx, end_column=7)
+            note_cell = ws.cell(row=row_idx, column=2, value=notes_text)
+            note_cell.alignment = Alignment(wrap_text=True, vertical='top', horizontal='right')
+            note_cell.border = thin_border
+            
+            # Apply border to all merged cells
+            for col in range(2, 8):
+                ws.cell(row=row_idx, column=col).border = thin_border
+            
+            row_idx += 1
+       
+        # Add visual separator
+        row_idx += 2
+        
+        # Update progress
+        progress = 60 + (part_idx + 1) * 30 / total_parts
+        progress_callback(int(progress))
+
+    # Adjust column widths for better readability
+    column_widths = [15, 20, 20, 20, 20, 20, 25]  # Points, COth, THme, RTV, OL, CR, AI Notes
+    for idx, width in enumerate(column_widths, start=1):
+        ws.column_dimensions[get_column_letter(idx)].width = width
+   
+    # Auto-fit row heights
+    for row in ws.iter_rows():
+        max_height = 15
+        for cell in row:
+            if cell.value and isinstance(cell.value, str) and '\n' in str(cell.value):
+                lines = str(cell.value).count('\n') + 1
+                max_height = max(max_height, lines * 15)
+        ws.row_dimensions[row[0].row].height = max_height
+
+    progress_callback(95)
+    log_callback('💾 حفظ ملف الإخراج...')
+    
+    try:
+        wb.save(output_path)
+    except Exception as e:
+        raise IOError(f'فشل في حفظ الملف: {e}')
+   
+    progress_callback(100)
+    log_callback(f'✅ تم حفظ النتائج بنجاح في: {Path(output_path).name}')
+    return output_path
+
+# ------------------ Enhanced User Interface ------------------
+
+class CorrosionApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title('🧪 حاسبة معدل التآكل — الإصدار المحسن 2024')
+        self.geometry('1200x800')
+        self.minsize(1000, 600)
+        
+        # Configure style
+        style = ttk.Style()
+        style.theme_use('clam')
+        
+        # Variables
+        self.input_path = tk.StringVar()
+        self.output_path = tk.StringVar()
+        self.rtv_factor = tk.DoubleVar(value=DEFAULT_RTV_FACTOR)
+        self.enable_ai = tk.BooleanVar(value=True)
+        self.processing = False
+        
+        # Auto-set output path when input changes
+        self.input_path.trace('w', self.auto_set_output_path)
+        
+        # Create UI
+        self.create_ui()
+        
+        # Center window
+        self.center_window()
+   
+    def center_window(self):
+        """Centers the window on screen"""
+        self.update_idletasks()
+        width = self.winfo_width()
+        height = self.winfo_height()
+        x = (self.winfo_screenwidth() // 2) - (width // 2)
+        y = (self.winfo_screenheight() // 2) - (height // 2)
+        self.geometry(f'{width}x{height}+{x}+{y}')
+    
+    def auto_set_output_path(self, *args):
+        """Automatically sets output path based on input path"""
+        inp = self.input_path.get().strip()
+        if inp and Path(inp).exists():
+            inp_path = Path(inp)
+            outp = str(inp_path.with_name(f'{inp_path.stem}_نتائج.xlsx'))
+            self.output_path.set(outp)
+    
+    def create_ui(self):
+        # Main container with padding
+        main_container = ttk.Frame(self, padding="20")
+        main_container.pack(fill='both', expand=True)
+        
+        # Title
+        title_label = tk.Label(main_container, text="🧪 حاسبة معدل التآكل المتطورة", 
+                              font=('Arial', 18, 'bold'), fg='#2c3e50')
+        title_label.pack(pady=(0, 20))
+        
+        # Create notebook
+        self.notebook = ttk.Notebook(main_container)
+        self.notebook.pack(fill='both', expand=True)
+        
+        # Create tabs
+        self.create_main_tab()
+        self.create_instructions_tab()
+        self.create_about_tab()
+    
+    def create_main_tab(self):
+        main_tab = ttk.Frame(self.notebook)
+        self.notebook.add(main_tab, text='🎯 الحاسبة الرئيسية')
+        
+        # Create scrollable frame
+        canvas = tk.Canvas(main_tab)
+        scrollbar = ttk.Scrollbar(main_tab, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+        
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        # Files Frame with enhanced styling
+        file_frame = ttk.LabelFrame(scrollable_frame, text='📁 إعداد ملفات الإدخال والإخراج', padding="15")
+        file_frame.pack(fill='x', pady=(0, 15))
+        
+        # Input file row
+        input_row = ttk.Frame(file_frame)
+        input_row.pack(fill='x', pady=5)
+        
+        ttk.Label(input_row, text='📂 ملف الإدخال (Excel):', font=('Arial', 10, 'bold')).pack(side='left', padx=(0, 10))
+        self.input_entry = ttk.Entry(input_row, textvariable=self.input_path, width=60, font=('Arial', 9))
+        self.input_entry.pack(side='left', fill='x', expand=True, padx=(0, 10))
+        ttk.Button(input_row, text='استعراض...', command=self.select_input).pack(side='right')
+        
+        # Output file row
+        output_row = ttk.Frame(file_frame)
+        output_row.pack(fill='x', pady=5)
+        
+        ttk.Label(output_row, text='💾 ملف الإخراج (Excel):', font=('Arial', 10, 'bold')).pack(side='left', padx=(0, 10))
+        self.output_entry = ttk.Entry(output_row, textvariable=self.output_path, width=60, font=('Arial', 9))
+        self.output_entry.pack(side='left', fill='x', expand=True, padx=(0, 10))
+        ttk.Button(output_row, text='استعراض...', command=self.select_output).pack(side='right')
+        
+        # Settings Frame
+        settings_frame = ttk.LabelFrame(scrollable_frame, text='⚙️ إعدادات المعالجة المتقدمة', padding="15")
+        settings_frame.pack(fill='x', pady=(0, 15))
+        
+        # RTV Factor setting
+        rtv_row = ttk.Frame(settings_frame)
+        rtv_row.pack(fill='x', pady=5)
+        
+        ttk.Label(rtv_row, text='🔢 عامل RTV:', font=('Arial', 10, 'bold')).pack(side='left', padx=(0, 10))
+        rtv_spinbox = ttk.Spinbox(rtv_row, from_=1.0, to=5.0, increment=0.001, 
+                                 textvariable=self.rtv_factor, width=15, format="%.3f")
+        rtv_spinbox.pack(side='left', padx=(0, 20))
+        ttk.Label(rtv_row, text='(القيمة الافتراضية: 2.331)', font=('Arial', 9), foreground='gray').pack(side='left')
+        
+        # AI settings
+        ai_row = ttk.Frame(settings_frame)
+        ai_row.pack(fill='x', pady=10)
+        
+        if HAS_SK:
+            ai_check = ttk.Checkbutton(ai_row, text='🤖 تفعيل الذكاء الاصطناعي للكشف عن القيم الشاذة', 
+                                      variable=self.enable_ai)
+            ai_check.pack(side='left')
+            ttk.Label(ai_row, text='(يتطلب scikit-learn)', font=('Arial', 8), foreground='green').pack(side='left', padx=(10, 0))
+        else:
+            ttk.Label(ai_row, text='⚠️ الذكاء الاصطناعي غير متاح. يرجى تثبيت scikit-learn لتفعيل هذه الميزة.', 
+                     foreground='orange', font=('Arial', 10)).pack(side='left')
+            self.enable_ai.set(False)
+        
+        # Action Buttons Frame
+        action_frame = ttk.Frame(scrollable_frame)
+        action_frame.pack(fill='x', pady=(0, 15))
+        
+        # Left side buttons
+        left_buttons = ttk.Frame(action_frame)
+        left_buttons.pack(side='left')
+        
+        preview_btn = ttk.Button(left_buttons, text='👁️ معاينة الملف', command=self.preview_input)
+        preview_btn.pack(side='left', padx=(0, 10), ipady=8)
+        
+        process_btn = ttk.Button(left_buttons, text='🚀 تشغيل وحفظ النتائج', command=self.run_processing)
+        process_btn.pack(side='left', padx=(0, 10), ipady=8)
+        
+        open_output_btn = ttk.Button(left_buttons, text='📊 فتح ملف النتائج', command=self.open_output_file)
+        open_output_btn.pack(side='left', padx=(0, 10), ipady=8)
+        
+        # Right side buttons
+        right_buttons = ttk.Frame(action_frame)
+        right_buttons.pack(side='right')
+        
+        ttk.Button(right_buttons, text='❌ إغلاق', command=self.quit).pack(side='right', ipady=8)
+        
+        # Progress Bar
+        progress_frame = ttk.Frame(scrollable_frame)
+        progress_frame.pack(fill='x', pady=(0, 15))
+        
+        ttk.Label(progress_frame, text='📊 شريط التقدم:', font=('Arial', 10, 'bold')).pack(anchor='w')
+        self.progress_bar = ttk.Progressbar(progress_frame, mode='determinate', length=600)
+        self.progress_bar.pack(fill='x', pady=(5, 0))
+        
+        self.progress_label = ttk.Label(progress_frame, text='في انتظار البدء...', font=('Arial', 9))
+        self.progress_label.pack(anchor='w', pady=(5, 0))
+        
+        # Log Panel
+        log_frame = ttk.LabelFrame(scrollable_frame, text='📋 سجل العمليات والتقارير المفصلة', padding="10")
+        log_frame.pack(fill='both', expand=True)
+        
+        # Create text widget with scrollbar
+        log_container = ttk.Frame(log_frame)
+        log_container.pack(fill='both', expand=True)
+        
+        self.txt = tk.Text(log_container, wrap='word', height=15, state='disabled', 
+                          font=('Consolas', 9), bg='#f8f9fa', fg='#2c3e50')
+        log_scrollbar = ttk.Scrollbar(log_container, orient='vertical', command=self.txt.yview)
+        self.txt.configure(yscrollcommand=log_scrollbar.set)
+        
+        self.txt.pack(side='left', fill='both', expand=True)
+        log_scrollbar.pack(side='right', fill='y')
+        
+        # Configure text tags for different message types
+        self.txt.tag_configure('info', foreground='#2c3e50')
+        self.txt.tag_configure('success', foreground='#27ae60', font=('Consolas', 9, 'bold'))
+        self.txt.tag_configure('warning', foreground='#f39c12', font=('Consolas', 9, 'bold'))
+        self.txt.tag_configure('error', foreground='#e74c3c', font=('Consolas', 9, 'bold'))
+        self.txt.tag_configure('processing', foreground='#3498db', font=('Consolas', 9, 'bold'))
+        
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        # Initial welcome message
+        self.log_message('🎉 مرحباً بك في حاسبة معدل التآكل المحسنة!', 'success')
+        self.log_message('📌 ابدأ باختيار ملف الإدخال، وسيتم تحديد ملف الإخراج تلقائياً.', 'info')
+    
+    def create_instructions_tab(self):
+        instructions_tab = ttk.Frame(self.notebook)
+        self.notebook.add(instructions_tab, text='📖 دليل الاستخدام')
+        
+        # Create scrollable frame for instructions
+        canvas = tk.Canvas(instructions_tab)
+        scrollbar = ttk.Scrollbar(instructions_tab, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+        
+        scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        instructions_text = tk.Text(scrollable_frame, wrap='word', font=('Arial', 11), 
+                                  state='normal', bg='#f8f9fa', relief='flat', 
+                                  padx=20, pady=20)
+        instructions_text.pack(fill='both', expand=True)
+        
+        # Configure text styles
+        instructions_text.tag_configure('title', font=('Arial', 16, 'bold'), foreground='#2c3e50')
+        instructions_text.tag_configure('section', font=('Arial', 14, 'bold'), foreground='#34495e')
+        instructions_text.tag_configure('subsection', font=('Arial', 12, 'bold'), foreground='#7f8c8d')
+        instructions_text.tag_configure('highlight', background='#fff3cd', foreground='#856404')
+        instructions_text.tag_configure('code', font=('Consolas', 10), background='#f1f2f6', foreground='#2c3e50')
+        
+        # Insert comprehensive instructions
+        instructions_content = """🧪 دليل استخدام حاسبة معدل التآكل المتطورة
+
+═══════════════════════════════════════════════════════════════════════
+
+📋 1. نظرة عامة على البرنامج
+
+هذا البرنامج مصمم خصيصاً لمعالجة بيانات فحص التآكل في الأنابيب والمعدات الصناعية. يقوم البرنامج بقراءة ملفات Excel المحتوية على بيانات القياسات، وحساب معدلات التآكل، وإنتاج تقارير مفصلة ومنسقة.
+
+🎯 المميزات الرئيسية:
+• حساب معدل التآكل تلقائياً باستخدام معادلات معيارية
+• كشف القيم الشاذة باستخدام الذكاء الاصطناعي
+• إنتاج تقارير Excel منسقة ومفصلة
+• واجهة مستخدم عربية سهلة الاستخدام
+• شريط تقدم لمتابعة العمليات
+• سجل مفصل للعمليات والنتائج
+
+═══════════════════════════════════════════════════════════════════════
+
+📊 2. تنسيق ملف الإدخال المطلوب
+
+يجب أن يكون ملف الإدخال بتنسيق Excel (.xlsx أو .xls) ومنظماً كالتالي:
+
+🔸 هيكل البيانات:
+كل جزء أو أنبوب يبدأ بعنوان يحتوي على:
+• اسم الجزء (مثل: "أنبوب المياه الرئيسي")
+• القطر بالبوصة (مثل: "12 inch" أو '8"')
+
+🔸 رؤوس الأعمدة المطلوبة:
+┌─────────────────┬──────────────────────────────┐
+│ العمود          │ الوصف                        │
+├─────────────────┼──────────────────────────────┤
+│ Points          │ رقم أو اسم النقطة            │
+│ Coth_new (μm)   │ سماكة الطلاء الجديدة        │
+│ Thme_new(mm)    │ السماكة الجديدة للمعدن      │
+│ RTV (mm)        │ قيمة RTV القديمة           │
+│ Notes           │ ملاحظات إضافية              │
+└─────────────────┴──────────────────────────────┘
+
+🔸 مثال على التنسيق:
+أنبوب المياه الرئيسي 12"
+Points | Coth_new (μm) | Thme_new(mm) | RTV (mm)
+P1     | 125          | 8.5          | 8.2
+P2     | 130          | 8.3          | 8.1
+...
+
+═══════════════════════════════════════════════════════════════════════
+
+🧮 3. الحسابات والمعادلات
+
+يقوم البرنامج بتنفيذ الحسابات التالية:
+
+🔹 حساب RTV الجديدة:
+RTV_new = Thme_new - (RTV_Factor × Coth_new × 0.001)
+
+حيث:
+• RTV_Factor: العامل المستخدم (افتراضي 2.331)
+• Coth_new: سماكة الطلاء الجديدة بالميكرون
+• Thme_new: السماكة الجديدة للمعدن بالمليمتر
+
+🔹 حساب معدل التآكل (CR):
+CR = RTV_old - RTV_new
+
+حيث:
+• RTV_old: قيمة RTV القديمة من ملف الإدخال
+• RTV_new: قيمة RTV المحسوبة حديثاً
+
+═══════════════════════════════════════════════════════════════════════
+
+🤖 4. نظام الذكاء الاصطناعي
+
+عند تفعيل الذكاء الاصطناعي، يقوم البرنامج بـ:
+
+🔸 كشف القيم الشاذة:
+• استخدام خوارزمية Isolation Forest
+• تحليل جميع القيم الرقمية في البيانات
+• تحديد النقاط التي تنحرف عن النمط العام
+
+🔸 التقرير:
+• عرض القيم الشاذة في عمود منفصل
+• إحصائيات مفصلة في سجل العمليات
+• توصيات للمراجعة اليدوية
+
+⚠️ ملاحظة: يتطلب تثبيت مكتبة scikit-learn
+
+═══════════════════════════════════════════════════════════════════════
+
+📄 5. تنسيق ملف الإخراج
+
+يتم إنشاء ملف Excel جديد بالتنسيق التالي:
+
+🔸 لكل جزء:
+┌─────────────────────────────────────────────────┐
+│ اسم الجزء: [اسم الجزء] │ قطره بالانش: [القطر] │
+├─────────────────────────────────────────────────┤
+│ Points │ COth │ THme │ RTV │ OL │ CR │ ملاحظات AI │
+│        │ (mm) │ (mm) │(mm) │(mm)│(mm)│             │
+├────────┼──────┼──────┼─────┼────┼────┼─────────────┤
+│ P1     │ 0.125│ 8.5  │ 8.21│8.2 │-0.01│            │
+│ P2     │ 0.130│ 8.3  │ 8.00│8.1 │0.10 │ قيمة شاذة  │
+└────────┴──────┴──────┴─────┴────┴────┴─────────────┘
+الملاحظات: [ملاحظات الجزء إن وجدت]
+
+🔸 التنسيق المتقدم:
+• حدود واضحة لجميع الخلايا
+• ألوان متدرجة للعناوين
+• تنسيق خاص للقيم الشاذة (أحمر وغامق)
+• دمج الخلايا للملاحظات
+• عرض أعمدة محسن للقراءة
+
+═══════════════════════════════════════════════════════════════════════
+
+🚀 6. خطوات الاستخدام
+
+1️⃣ اختيار ملف الإدخال:
+   • انقر على "استعراض" بجانب ملف الإدخال
+   • اختر ملف Excel يحتوي على البيانات
+
+2️⃣ تحديد ملف الإخراج (اختياري):
+   • سيتم تحديده تلقائياً بناءً على ملف الإدخال
+   • يمكنك تغييره حسب الحاجة
+
+3️⃣ ضبط الإعدادات:
+   • تعديل عامل RTV إذا لزم الأمر
+   • تفعيل/إلغاء الذكاء الاصطناعي
+
+4️⃣ المعاينة (اختياري):
+   • انقر "معاينة الملف" للتأكد من صحة البيانات
+
+5️⃣ تشغيل المعالجة:
+   • انقر "تشغيل وحفظ النتائج"
+   • تابع التقدم في شريط التقدم
+
+6️⃣ مراجعة النتائج:
+   • انقر "فتح ملف النتائج" لمشاهدة التقرير
+   • راجع سجل العمليات للتفاصيل
+
+═══════════════════════════════════════════════════════════════════════
+
+⚠️ 7. نصائح مهمة ومعالجة الأخطاء
+
+🔸 متطلبات ملف الإدخال:
+• تأكد من وجود عناوين الأجزاء بوضوح
+• تحقق من صحة أسماء الأعمدة
+• تأكد من أن البيانات الرقمية صحيحة
+
+🔸 الأخطاء الشائعة:
+• "لم يتم العثور على بيانات صالحة": تحقق من تنسيق الملف
+• "خطأ في القراءة": تأكد أن الملف ليس مفتوحاً في برنامج آخر
+• "فشل في الحفظ": تحقق من الصلاحيات ومساحة القرص
+
+🔸 نصائح للحصول على أفضل النتائج:
+• استخدم أسماء واضحة للأجزاء
+• تأكد من دقة البيانات المدخلة
+• راجع القيم الشاذة المكتشفة يدوياً
+• احتفظ بنسخ احتياطية من الملفات
+
+═══════════════════════════════════════════════════════════════════════
+
+📞 8. الدعم والمساعدة
+
+إذا واجهت أي مشاكل أو كان لديك استفسارات:
+• راجع سجل العمليات للتفاصيل المفصلة
+• تأكد من تثبيت جميع المكتبات المطلوبة
+• تحقق من تنسيق ملف الإدخال
+
+🎯 البرنامج مصمم ليكون سهل الاستخدام ودقيق في النتائج. 
+   استمتع بالاستخدام! 🚀"""
+        
+        instructions_text.insert('1.0', instructions_content)
+        instructions_text.config(state='disabled')
+        
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+    
+    def create_about_tab(self):
+        about_tab = ttk.Frame(self.notebook)
+        self.notebook.add(about_tab, text='ℹ️ حول البرنامج')
+        
+        about_frame = ttk.Frame(about_tab, padding="30")
+        about_frame.pack(fill='both', expand=True)
+        
+        # Title
+        title_label = tk.Label(about_frame, text="🧪 حاسبة معدل التآكل المتطورة", 
+                              font=('Arial', 20, 'bold'), fg='#2c3e50')
+        title_label.pack(pady=(0, 20))
+        
+        # Version info
+        version_label = tk.Label(about_frame, text="الإصدار 2.0 المحسن - 2024", 
+                                font=('Arial', 12), fg='#7f8c8d')
+        version_label.pack(pady=(0, 30))
+        
+        # Features
+        features_text = """
+🎯 المميزات الرئيسية:
+
+✅ حساب معدل التآكل تلقائياً باستخدام المعادلات المعيارية
+✅ كشف القيم الشاذة باستخدام خوارزميات الذكاء الاصطناعي
+✅ إنتاج تقارير Excel مفصلة ومنسقة بشكل احترافي
+✅ واجهة مستخدم عربية سهلة ومتطورة
+✅ شريط تقدم لمتابعة العمليات في الوقت الفعلي
+✅ سجل مفصل للعمليات والنتائج
+✅ دعم ملفات Excel متعددة الأوراق
+✅ حفظ تلقائي مع تسمية ذكية للملفات
+
+🔧 التقنيات المستخدمة:
+
+• Python 3.7+
+• Tkinter للواجهة الرسومية
+• Pandas لمعالجة البيانات
+• OpenPyXL للتعامل مع ملفات Excel
+• Scikit-learn للذكاء الاصطناعي
+• NumPy للحسابات الرياضية
+
+📊 يدعم البرنامج معالجة آلاف النقاط في ثوانٍ معدودة!
+        """
+        
+        features_label = tk.Label(about_frame, text=features_text, 
+                                 font=('Arial', 11), justify='right', fg='#34495e')
+        features_label.pack(pady=20)
+        
+        # Copyright
+        copyright_label = tk.Label(about_frame, 
+                                  text="© 2024 - برنامج مطور خصيصاً لحساب معدل التآكل في المعدات الصناعية", 
+                                  font=('Arial', 10), fg='#95a5a6')
+        copyright_label.pack(pady=(30, 0))
+    
+    def log_message(self, msg, tag='info'):
+        """Enhanced logging with colored messages and timestamps"""
+        timestamp = datetime.datetime.now().strftime('%H:%M:%S')
+        log_entry = f'[{timestamp}] {msg}\n'
+        
+        self.txt.config(state='normal')
+        start_pos = self.txt.index('end-1c')
+        self.txt.insert('end', log_entry)
+        
+        # Apply tag for styling
+        end_pos = self.txt.index('end-1c')
+        self.txt.tag_add(tag, start_pos, end_pos)
+        
+        self.txt.see('end')
+        self.txt.config(state='disabled')
+        self.update_idletasks()
+    
+    def update_progress(self, value, status=""):
+        """Update progress bar and status"""
+        self.progress_bar['value'] = value
+        if status:
+            self.progress_label.config(text=status)
+        self.update_idletasks()
+    
+    def select_input(self):
+        filetypes = [
+            ('Excel files', '*.xlsx *.xls'),
+            ('Excel 2007+', '*.xlsx'),
+            ('Excel 97-2003', '*.xls'),
+            ('All files', '*.*')
+        ]
+        p = filedialog.askopenfilename(
+            title='اختيار ملف الإدخال',
+            filetypes=filetypes
+        )
+        if p:
+            self.input_path.set(p)
+            self.log_message(f'تم اختيار ملف الإدخال: {Path(p).name}', 'success')
+    
+    def select_output(self):
+        p = filedialog.asksaveasfilename(
+            title='اختيار موقع حفظ النتائج',
+            defaultextension='.xlsx',
+            filetypes=[
+                ('Excel 2007+', '*.xlsx'),
+                ('All files', '*.*')
+            ]
+        )
+        if p:
+            self.output_path.set(p)
+            self.log_message(f'تم تحديد مسار الإخراج: {Path(p).name}', 'success')
+    
+    def preview_input(self):
+        p = self.input_path.get().strip()
+        if not p:
+            messagebox.showwarning('تحذير', 'الرجاء اختيار ملف إدخال أولاً.')
+            return
+        
+        if not Path(p).exists():
+            messagebox.showerror('خطأ', 'الملف المحدد غير موجود.')
+            return
+        
+        self.log_message('جاري معاينة الملف...', 'processing')
+        try:
+            xls = pd.read_excel(p, sheet_name=None, header=None, dtype=str)
+            self.log_message(f'تم فتح الملف بنجاح: {Path(p).name}', 'success')
+            
+            total_sheets = len(xls)
+            total_rows = sum(df.shape[0] for df in xls.values())
+            total_cols = max(df.shape[1] for df in xls.values()) if xls else 0
+            
+            self.log_message(f'📊 إحصائيات الملف:', 'info')
+            self.log_message(f'   • عدد أوراق العمل: {total_sheets}', 'info')
+            self.log_message(f'   • إجمالي الصفوف: {total_rows:,}', 'info')
+            self.log_message(f'   • أقصى عدد أعمدة: {total_cols}', 'info')
+            
+            for sheet_name, df in xls.items():
+                self.log_message(f'   • ورقة "{sheet_name}": {df.shape[0]} صف × {df.shape[1]} عمود', 'info')
+                
+        except Exception as e:
+            self.log_message(f'خطأ في معاينة الملف: {str(e)}', 'error')
+            messagebox.showerror('خطأ في المعاينة', f'حدث خطأ: {e}')
+    
+    def open_output_file(self):
+        """Open the output file if it exists"""
+        output_path = self.output_path.get().strip()
+        if not output_path:
+            messagebox.showwarning('تحذير', 'لم يتم تحديد ملف إخراج.')
+            return
+        
+        if not Path(output_path).exists():
+            messagebox.showwarning('تحذير', 'ملف الإخراج غير موجود. يرجى تشغيل المعالجة أولاً.')
+            return
+        
+        try:
+            if sys.platform == "win32":
+                os.startfile(output_path)
+            elif sys.platform == "darwin":
+                subprocess.call(["open", output_path])
+            else:
+                subprocess.call(["xdg-open", output_path])
+            self.log_message(f'تم فتح ملف النتائج: {Path(output_path).name}', 'success')
+        except Exception as e:
+            self.log_message(f'خطأ في فتح الملف: {str(e)}', 'error')
+            messagebox.showerror('خطأ', f'لا يمكن فتح الملف: {e}')
+    
+    def run_processing(self):
+        if self.processing:
+            messagebox.showinfo('تنبيه', 'المعالجة قيد التشغيل حالياً. يرجى الانتظار.')
+            return
+        
+        inp = self.input_path.get().strip()
+        outp = self.output_path.get().strip()
+        
+        if not inp:
+            messagebox.showwarning('تحذير', 'يجب اختيار ملف إدخال.')
+            return
+        
+        if not Path(inp).exists():
+            messagebox.showerror('خطأ', 'ملف الإدخال غير موجود.')
+            return
+        
+        if not outp:
+            messagebox.showwarning('تحذير', 'يجب تحديد ملف الإخراج.')
+            return
+        
+        # Start processing in a separate thread
+        self.processing = True
+        self.progress_bar['value'] = 0
+        self.progress_label.config(text='بدء المعالجة...')
+        
+        def process():
+            try:
+                self.log_message('=' * 60, 'processing')
+                self.log_message('🚀 بدء عملية المعالجة الشاملة', 'processing')
+                self.log_message('=' * 60, 'processing')
+                
+                def progress_callback(value):
+                    self.after(0, lambda: self.update_progress(value, f'جاري المعالجة... {value}%'))
+                
+                def log_callback(msg):
+                    if '✅' in msg or 'تم' in msg:
+                        tag = 'success'
+                    elif '⚠️' in msg or 'تحذير' in msg:
+                        tag = 'warning'
+                    elif '❌' in msg or 'خطأ' in msg:
+                        tag = 'error'
+                    elif '🔄' in msg or '🔍' in msg or '⚙️' in msg:
+                        tag = 'processing'
+                    else:
+                        tag = 'info'
+                    self.after(0, lambda m=msg, t=tag: self.log_message(m, t))
+                
+                result_path = process_excel_file(
+                    input_path=inp,
+                    output_path=outp,
+                    rtv_factor=self.rtv_factor.get(),
+                    enable_ai=self.enable_ai.get(),
+                    log_callback=log_callback,
+                    progress_callback=progress_callback
+                )
+                
+                self.after(0, lambda: self.processing_complete(result_path))
+                
+            except Exception as e:
+                self.after(0, lambda: self.processing_error(str(e)))
+        
+        thread = threading.Thread(target=process, daemon=True)
+        thread.start()
+    
+    def processing_complete(self, result_path):
+        """Handle successful completion"""
+        self.processing = False
+        self.update_progress(100, 'اكتملت المعالجة بنجاح! ✅')
+        
+        self.log_message('=' * 60, 'success')
+        self.log_message('🎉 تمت المعالجة بنجاح!', 'success')
+        self.log_message(f'📁 ملف النتائج: {Path(result_path).name}', 'success')
+        self.log_message('=' * 60, 'success')
+        
+        # Show completion dialog with options
+        result = messagebox.askyesno(
+            'تمت المعالجة بنجاح! 🎉',
+            f'تم حفظ النتائج في:\n{result_path}\n\nهل تريد فتح الملف الآن؟'
+        )
+        
+        if result:
+            self.open_output_file()
+    
+    def processing_error(self, error_msg):
+        """Handle processing error"""
+        self.processing = False
+        self.update_progress(0, 'حدث خطأ في المعالجة ❌')
+        
+        self.log_message('=' * 60, 'error')
+        self.log_message(f'❌ فشلت المعالجة: {error_msg}', 'error')
+        self.log_message('=' * 60, 'error')
+        
+        messagebox.showerror('خطأ في المعالجة', f'حدث خطأ:\n{error_msg}')
+
+# ------------------ Main Application Entry Point ------------------
+
+def main():
+    """Main function to run the application"""
+    try:
+        app = CorrosionApp()
+        app.mainloop()
+    except Exception as e:
+        messagebox.showerror('خطأ في تشغيل البرنامج', f'حدث خطأ في تشغيل البرنامج:\n{e}')
+
+if __name__ == '__main__':
+    main()
